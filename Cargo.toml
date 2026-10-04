@@ -146,11 +146,6 @@ type-map = "0.5.1"
 unicode_names2 = { version = "3.1", default-features = false }
 unicode-general-category = "1.1"
 unicode-segmentation = "1.13"
-vello_cpu = { version = "0.1.0", default-features = false, features = [
-  "std",
-  "u8_pipeline",
-  "f32_pipeline",
-] }
 wasm-bindgen = "0.2.126" # Keep wasm-bindgen version in sync in: setup_web.sh, Cargo.toml, Cargo.lock, rust.yml. Don't update this spuriously, because of https://github.com/rerun-io/rerun/issues/8766
 wasm-bindgen-futures = "0.4.76"
 wayland-cursor = { version = "0.31.14", default-features = false }
@@ -160,6 +155,7 @@ webbrowser = "1.2"
 wgpu = { version = "30.0", default-features = false, features = ["std"] }
 windows-sys = "0.61.2"
 winit = { version = "0.30.13", default-features = false }
+zeno = { version = "0.3.3", default-features = false, features = ["eval", "std"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

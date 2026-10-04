@@ -5,7 +5,6 @@ use emath::{GuiRounding as _, OrderedFloat, Vec2, vec2};
 use self_cell::self_cell;
 use skrifa::{GlyphId, MetadataProvider as _};
 use std::collections::BTreeMap;
-use vello_cpu::{color, kurbo};
 
 use crate::{
     TextOptions, TextureAtlas,
@@ -231,10 +230,11 @@ impl FontCell {
             "Can't allocate glyph for id 0"
         );
 
-        let mut path = kurbo::BezPath::new();
-        let mut pen = VelloPen {
-            path: &mut path,
-            x_offset: bin.as_float() as f64,
+        let mut pen = GlyphPen {
+            commands: Vec::new(),
+            x_offset: bin.as_float(),
+            min: zeno::Point::new(f32::INFINITY, f32::INFINITY),
+            max: zeno::Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY),
         };
 
         self.with_dependent_mut(|_, font_data| {
@@ -263,40 +263,28 @@ impl FontCell {
             Some(())
         })?;
 
-        let bounds = path.control_box().expand();
-        let width = bounds.width() as u16;
-        let height = bounds.height() as u16;
-
-        let uv_rect = if width == 0 || height == 0 {
-            UvRect::default()
-        } else {
-            let mut ctx = vello_cpu::RenderContext::new(width, height);
-            ctx.set_transform(kurbo::Affine::translate((-bounds.x0, -bounds.y0)));
-            ctx.set_paint(color::OpaqueColor::<color::Srgb>::WHITE);
-            ctx.fill_path(&path);
-            let mut dest = vello_cpu::Pixmap::new(width, height);
-            let mut resources = vello_cpu::Resources::new();
-            ctx.render(&mut dest, &mut resources);
+        let uv_rect = if let Some((x0, y0, width, height)) = pen.pixel_bounds() {
+            let mut coverage = vec![0u8; width as usize * height as usize];
+            zeno::Mask::new(pen.commands.as_slice())
+                .size(width as u32, height as u32)
+                .offset(zeno::Vector::new(-x0, -y0))
+                .render_into(&mut coverage, None);
 
             let glyph_pos = {
                 let color_transfer_function = atlas.options().color_transfer_function;
                 let (glyph_pos, image) = atlas.allocate((width as usize, height as usize));
-                let pixels = dest.data_as_u8_slice();
                 for y in 0..height as usize {
                     for x in 0..width as usize {
-                        let pixel_offset = 4 * ((y * width as usize) + x);
+                        let alpha = coverage[y * width as usize + x];
                         image[(x + glyph_pos.0, y + glyph_pos.1)] = color_transfer_function
                             .to_atlas_color(Color32::from_rgba_premultiplied(
-                                pixels[pixel_offset],
-                                pixels[pixel_offset + 1],
-                                pixels[pixel_offset + 2],
-                                pixels[pixel_offset + 3],
+                                alpha, alpha, alpha, alpha,
                             ));
                     }
                 }
                 glyph_pos
             };
-            let offset_in_pixels = vec2(bounds.x0 as f32, bounds.y0 as f32);
+            let offset_in_pixels = vec2(x0, y0);
             let offset =
                 offset_in_pixels / metrics.pixels_per_point + metrics.y_offset_in_points * Vec2::Y;
             UvRect {
@@ -308,43 +296,70 @@ impl FontCell {
                     (glyph_pos.1 + height as usize) as u16,
                 ],
             }
+        } else {
+            UvRect::default()
         };
 
         Some(GlyphAllocation { uv_rect })
     }
 }
 
-struct VelloPen<'a> {
-    path: &'a mut kurbo::BezPath,
-    x_offset: f64,
+/// Collects a glyph's outline for `zeno`, flipped so y grows downward, and
+/// the box its points span.
+struct GlyphPen {
+    commands: Vec<zeno::Command>,
+    x_offset: f32,
+    min: zeno::Point,
+    max: zeno::Point,
 }
 
-impl skrifa::outline::OutlinePen for VelloPen<'_> {
+impl GlyphPen {
+    fn point(&mut self, x: f32, y: f32) -> zeno::Point {
+        let p = zeno::Point::new(x + self.x_offset, -y);
+        self.min = zeno::Point::new(self.min.x.min(p.x), self.min.y.min(p.y));
+        self.max = zeno::Point::new(self.max.x.max(p.x), self.max.y.max(p.y));
+        p
+    }
+
+    /// The whole pixels the outline touches: the left and top edge, the width
+    /// and the height. `None` for an outline that covers no pixel.
+    fn pixel_bounds(&self) -> Option<(f32, f32, u16, u16)> {
+        if self.commands.is_empty() {
+            return None;
+        }
+        let (x0, y0) = (self.min.x.floor(), self.min.y.floor());
+        let width = (self.max.x.ceil() - x0) as u16;
+        let height = (self.max.y.ceil() - y0) as u16;
+        (width > 0 && height > 0).then_some((x0, y0, width, height))
+    }
+}
+
+impl skrifa::outline::OutlinePen for GlyphPen {
     fn move_to(&mut self, x: f32, y: f32) {
-        self.path.move_to((x as f64 + self.x_offset, -y as f64));
+        let p = self.point(x, y);
+        self.commands.push(zeno::Command::MoveTo(p));
     }
 
     fn line_to(&mut self, x: f32, y: f32) {
-        self.path.line_to((x as f64 + self.x_offset, -y as f64));
+        let p = self.point(x, y);
+        self.commands.push(zeno::Command::LineTo(p));
     }
 
     fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
-        self.path.quad_to(
-            (cx0 as f64 + self.x_offset, -cy0 as f64),
-            (x as f64 + self.x_offset, -y as f64),
-        );
+        let c = self.point(cx0, cy0);
+        let p = self.point(x, y);
+        self.commands.push(zeno::Command::QuadTo(c, p));
     }
 
     fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
-        self.path.curve_to(
-            (cx0 as f64 + self.x_offset, -cy0 as f64),
-            (cx1 as f64 + self.x_offset, -cy1 as f64),
-            (x as f64 + self.x_offset, -y as f64),
-        );
+        let c0 = self.point(cx0, cy0);
+        let c1 = self.point(cx1, cy1);
+        let p = self.point(x, y);
+        self.commands.push(zeno::Command::CurveTo(c0, c1, p));
     }
 
     fn close(&mut self) {
-        self.path.close_path();
+        self.commands.push(zeno::Command::Close);
     }
 }
 
