@@ -24,8 +24,17 @@ struct ScrollingToTarget {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct State {
-    /// Positive offset means scrolling down/right
+    /// Positive offset means scrolling down/right.
+    ///
+    /// This can be outside of the valid range while the user is
+    /// rubber-banding past the edge of the content (see [`crate::style::KineticScrollStyle::rubber_band`]).
+    /// Use [`Self::clamped_offset`] to get the offset within the valid range.
     pub offset: Vec2,
+
+    /// The largest valid offset, as of last frame: `content_size - viewport_size`.
+    ///
+    /// Can be negative if the content is smaller than the viewport.
+    max_offset: Vec2,
 
     /// If set, quickly but smoothly scroll to this target offset.
     offset_target: [Option<ScrollingToTarget>; 2],
@@ -59,6 +68,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             offset: Vec2::ZERO,
+            max_offset: Vec2::ZERO,
             offset_target: Default::default(),
             show_scroll: Vec2b::FALSE,
             content_is_too_large: Vec2b::FALSE,
@@ -84,6 +94,93 @@ impl State {
     pub fn velocity(&self) -> Vec2 {
         self.vel
     }
+
+    /// The scroll offset, clamped to the valid range `0..=max_offset`.
+    ///
+    /// This differs from [`Self::offset`] only while the user is rubber-banding
+    /// past the edge of the content.
+    pub fn clamped_offset(&self) -> Vec2 {
+        Vec2::new(
+            scroll_bounds(self.max_offset.x).clamp(self.offset.x),
+            scroll_bounds(self.max_offset.y).clamp(self.offset.y),
+        )
+    }
+
+    /// How far past the edge of the content we are, in ui points.
+    ///
+    /// Negative means past the start (top/left), positive means past the end (bottom/right).
+    /// Zero when not rubber-banding.
+    pub fn overscroll(&self) -> Vec2 {
+        self.offset - self.clamped_offset()
+    }
+}
+
+/// The valid range of scroll offsets along one axis.
+fn scroll_bounds(max_offset: f32) -> Rangef {
+    Rangef::new(0.0, max_offset.at_least(0.0))
+}
+
+/// Apply a drag `delta` (in offset space) to `offset`,
+/// with rubber-band resistance outside of `bounds`.
+///
+/// Modeled after iOS: the content follows the finger with the given `slope` at the edge,
+/// and the resistance grows as we get further out,
+/// asymptotically approaching an overscroll of `viewport_extent`.
+fn rubber_band_drag(
+    mut offset: f32,
+    mut delta: f32,
+    bounds: Rangef,
+    viewport_extent: f32,
+    slope: f32,
+) -> f32 {
+    // Move freely while inside the bounds:
+    if bounds.contains(offset) {
+        let unclamped = offset + delta;
+        offset = bounds.clamp(unclamped);
+        delta = unclamped - offset;
+    }
+    if delta == 0.0 {
+        return offset;
+    }
+
+    let edge = bounds.clamp(offset);
+    let overscroll = offset - edge;
+
+    // iOS: `overscroll(raw) = d · (1 − 1 / (slope · raw / d + 1))`, with `d = viewport_extent`.
+    // Differentiating gives `d overscroll / d raw = slope · (1 − overscroll / d)²`,
+    // which we integrate incrementally so we don't need to track the raw finger distance.
+    let fraction = if 0.0 < viewport_extent {
+        (overscroll.abs() / viewport_extent).min(1.0)
+    } else {
+        1.0
+    };
+    let factor = slope * (1.0 - fraction).powi(2);
+
+    let new_overscroll = overscroll + delta * factor;
+
+    if overscroll != 0.0 && new_overscroll.signum() != overscroll.signum() {
+        // We dragged back past the edge into the valid range.
+        // Spend the rest of the delta moving freely inside the bounds:
+        let delta_to_reach_edge = -overscroll / factor;
+        let remaining = delta - delta_to_reach_edge;
+        bounds.clamp(edge + remaining)
+    } else {
+        edge + new_overscroll
+    }
+}
+
+/// Advance a critically damped spring by `dt`, returning the new `(position, velocity)`.
+///
+/// The spring pulls towards zero with time constant `time_constant`.
+/// This is the exact solution, so it is independent of frame rate.
+fn critically_damped_spring_step(x0: f32, v0: f32, dt: f32, time_constant: f32) -> (f32, f32) {
+    if time_constant <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let w = 1.0 / time_constant;
+    let e = (-w * dt).exp();
+    let a = v0 + w * x0;
+    ((x0 + a * dt) * e, (v0 - a * w * dt) * e)
 }
 
 pub struct ScrollAreaOutput<R> {
@@ -705,6 +802,10 @@ struct Prepared {
     background_drag_response: Option<Response>,
 
     animated: bool,
+
+    /// Along which axes the offset is deliberately outside the valid range this frame
+    /// (rubber-banding), and so should not be clamped.
+    rubber_banding: Vec2b,
 }
 
 impl ScrollArea {
@@ -828,6 +929,9 @@ impl ScrollArea {
         let viewport = Rect::from_min_size(Pos2::ZERO + state.offset, inner_size);
         let dt = ui.input(|i| i.stable_dt).at_most(0.1);
 
+        let kinetic_style = ui.spacing().scroll.kinetic;
+        let mut rubber_banding = Vec2b::FALSE;
+
         let background_drag_response = if scroll_source.drag.enabled(ui.ctx())
             && ui.is_enabled()
             && state.content_is_too_large.any()
@@ -839,15 +943,33 @@ impl ScrollArea {
                 .interact_rect
                 .map(|rect| ui.interact(rect, id.with("area"), Sense::DRAG));
 
+            // Only rubber-band along axes that actually have something to scroll:
+            let rubber_band_enabled = |d: usize| {
+                kinetic_style.rubber_band && direction_enabled[d] && state.content_is_too_large[d]
+            };
+
             if content_response_option
                 .as_ref()
                 .is_some_and(|response| response.dragged())
             {
+                let pointer_delta = ui.input(|input| input.pointer.delta());
                 for d in 0..2 {
                     if direction_enabled[d] {
-                        ui.input(|input| {
-                            state.offset[d] -= input.pointer.delta()[d];
-                        });
+                        // Offset has an inverted coordinate system compared to the pointer:
+                        let delta = -pointer_delta[d];
+                        if rubber_band_enabled(d) {
+                            let bounds = scroll_bounds(state.max_offset[d]);
+                            state.offset[d] = rubber_band_drag(
+                                state.offset[d],
+                                delta,
+                                bounds,
+                                inner_size[d],
+                                kinetic_style.rubber_band_slope,
+                            );
+                            rubber_banding[d] = !bounds.contains(state.offset[d]);
+                        } else {
+                            state.offset[d] += delta;
+                        }
                         state.scroll_stuck_to_end[d] = false;
                         state.offset_target[d] = None;
                     }
@@ -861,28 +983,63 @@ impl ScrollArea {
                     state.vel =
                         direction_enabled.to_vec2() * ui.input(|input| input.pointer.velocity());
                 }
-                // Kinetic scrolling, modeled after `UIScrollView` on iOS/macOS:
-                // the velocity decays exponentially, `v(t) = v₀ · exp(-t / decay_time)`,
-                // so the total coast distance is `v₀ · decay_time`.
+
                 let crate::style::KineticScrollStyle {
                     decay_time,
                     stop_distance,
-                } = ui.spacing().scroll.kinetic;
+                    rubber_band: _,
+                    rubber_band_slope: _,
+                    rubber_band_time,
+                } = kinetic_style;
 
                 for d in 0..2 {
-                    let remaining_distance = state.vel[d].abs() * decay_time;
-                    if remaining_distance < stop_distance || !remaining_distance.is_finite() {
-                        state.vel[d] = 0.0;
+                    let bounds = scroll_bounds(state.max_offset[d]);
+                    let edge = bounds.clamp(state.offset[d]);
+                    let overscroll = state.offset[d] - edge;
+
+                    if rubber_band_enabled(d) && overscroll != 0.0 {
+                        // Spring back to the edge.
+                        // Offset has an inverted coordinate system compared to the velocity.
+                        let (new_overscroll, new_offset_vel) = critically_damped_spring_step(
+                            overscroll,
+                            -state.vel[d],
+                            dt,
+                            rubber_band_time,
+                        );
+                        let settled = new_overscroll.abs() < stop_distance
+                            && (new_offset_vel * rubber_band_time).abs() < stop_distance;
+                        if settled {
+                            state.offset[d] = edge;
+                            state.vel[d] = 0.0;
+                        } else {
+                            state.offset[d] = edge + new_overscroll;
+                            state.vel[d] = -new_offset_vel;
+                            rubber_banding[d] = !bounds.contains(state.offset[d]);
+                            ctx.request_repaint();
+                        }
                     } else {
-                        let new_vel = state.vel[d] * (-dt / decay_time).exp();
-                        // The exact integral of the velocity over this frame is
-                        // `decay_time * (old_vel - new_vel)`, which makes the
-                        // coast distance independent of frame rate.
-                        // Offset has an inverted coordinate system compared to
-                        // the velocity, so we subtract it instead of adding it.
-                        state.offset[d] -= decay_time * (state.vel[d] - new_vel);
-                        state.vel[d] = new_vel;
-                        ctx.request_repaint();
+                        // Kinetic scrolling, modeled after `UIScrollView` on iOS/macOS:
+                        // the velocity decays exponentially, `v(t) = v₀ · exp(-t / decay_time)`,
+                        // so the total coast distance is `v₀ · decay_time`.
+                        let remaining_distance = state.vel[d].abs() * decay_time;
+                        if remaining_distance < stop_distance || !remaining_distance.is_finite() {
+                            state.vel[d] = 0.0;
+                        } else {
+                            let new_vel = state.vel[d] * (-dt / decay_time).exp();
+                            // The exact integral of the velocity over this frame is
+                            // `decay_time * (old_vel - new_vel)`, which makes the
+                            // coast distance independent of frame rate.
+                            // Offset has an inverted coordinate system compared to
+                            // the velocity, so we subtract it instead of adding it.
+                            state.offset[d] -= decay_time * (state.vel[d] - new_vel);
+                            state.vel[d] = new_vel;
+                            ctx.request_repaint();
+
+                            if rubber_band_enabled(d) {
+                                // If we coasted past the edge, the spring takes over next frame:
+                                rubber_banding[d] = !bounds.contains(state.offset[d]);
+                            }
+                        }
                     }
                 }
             }
@@ -958,6 +1115,7 @@ impl ScrollArea {
             saved_scroll_target,
             background_drag_response,
             animated,
+            rubber_banding,
         }
     }
 
@@ -1085,6 +1243,7 @@ impl Prepared {
             saved_scroll_target,
             background_drag_response,
             animated,
+            rubber_banding,
         } = self;
 
         let content_size = content_ui.min_size();
@@ -1441,12 +1600,13 @@ impl Prepared {
                 state.scroll_start_offset_from_top_left[d] = None;
             }
 
-            let unbounded_offset = state.offset[d];
-            state.offset[d] = state.offset[d].max(0.0);
-            state.offset[d] = state.offset[d].min(max_offset[d]);
+            if !rubber_banding[d] {
+                let unbounded_offset = state.offset[d];
+                state.offset[d] = scroll_bounds(max_offset[d]).clamp(state.offset[d]);
 
-            if state.offset[d] != unbounded_offset {
-                state.vel[d] = 0.0;
+                if state.offset[d] != unbounded_offset {
+                    state.vel[d] = 0.0;
+                }
             }
 
             if ui.is_rect_visible(outer_scroll_bar_rect) {
@@ -1533,8 +1693,12 @@ impl Prepared {
         }
 
         let available_offset = content_size - inner_rect.size();
-        state.offset = state.offset.min(available_offset);
-        state.offset = state.offset.max(Vec2::ZERO);
+        for d in 0..2 {
+            if !rubber_banding[d] {
+                state.offset[d] = scroll_bounds(available_offset[d]).clamp(state.offset[d]);
+            }
+        }
+        state.max_offset = available_offset;
 
         let suppress_stuck_recompute = Vec2b::new(
             had_explicit_scroll_adjustment[0] && state.offset_target[0].is_some(),
@@ -1645,5 +1809,92 @@ fn paint_fade_areas_impl(ui: &Ui, inner_rect: Rect, content_size: Vec2, offset: 
             Direction::RightToLeft,
             [bg_faded, Color32::TRANSPARENT],
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rubber_band_drag_moves_freely_inside_bounds() {
+        let bounds = Rangef::new(0.0, 100.0);
+        assert_eq!(rubber_band_drag(10.0, 20.0, bounds, 200.0, 0.55), 30.0);
+        assert_eq!(rubber_band_drag(10.0, -5.0, bounds, 200.0, 0.55), 5.0);
+    }
+
+    #[test]
+    fn rubber_band_drag_resists_past_the_edge() {
+        let bounds = Rangef::new(0.0, 100.0);
+        let viewport = 200.0;
+        let slope = 0.55;
+
+        // At the edge, the content follows the finger with the given slope:
+        let offset = rubber_band_drag(0.0, -10.0, bounds, viewport, slope);
+        assert!((offset - -5.5).abs() < 1e-4, "{offset}");
+
+        // Resistance grows the further out we go, and we never exceed the viewport:
+        let mut offset = 0.0;
+        let mut prev_step = f32::INFINITY;
+        for _ in 0..1000 {
+            let new_offset = rubber_band_drag(offset, -10.0, bounds, viewport, slope);
+            let step = offset - new_offset;
+            assert!(0.0 <= step && step <= prev_step, "{step} > {prev_step}");
+            prev_step = step;
+            offset = new_offset;
+        }
+        assert!(-viewport < offset && offset < -viewport * 0.9, "{offset}");
+
+        // A delta that is partially inside is split: free up to the edge, resisted after.
+        let offset = rubber_band_drag(5.0, -15.0, bounds, viewport, slope);
+        assert!((offset - -5.5).abs() < 1e-4, "{offset}");
+    }
+
+    #[test]
+    fn rubber_band_drag_back_into_bounds() {
+        let bounds = Rangef::new(0.0, 100.0);
+        // From -5.5 overscroll, dragging +20 raw gets us back to the edge after ≈10.5
+        // (the resistance factor is ≈0.52 there), then moves freely for the remaining ≈9.5:
+        let offset = rubber_band_drag(-5.5, 20.0, bounds, 200.0, 0.55);
+        assert!((offset - 9.43).abs() < 0.05, "{offset}");
+    }
+
+    #[test]
+    fn spring_settles_without_overshoot() {
+        let tau = 0.1;
+        let (mut x, mut v) = (50.0, 0.0);
+        for _ in 0..120 {
+            let (new_x, new_v) = critically_damped_spring_step(x, v, 1.0 / 60.0, tau);
+            assert!(0.0 <= new_x && new_x <= x, "{new_x} vs {x}");
+            (x, v) = (new_x, new_v);
+        }
+        assert!(x < 0.01, "{x}");
+        assert!(v.abs() < 0.1, "{v}");
+    }
+
+    #[test]
+    fn spring_is_frame_rate_independent() {
+        let tau = 0.1;
+        let (x0, v0) = (50.0, -200.0);
+
+        let (mut x, mut v) = (x0, v0);
+        for _ in 0..60 {
+            (x, v) = critically_damped_spring_step(x, v, 1.0 / 60.0, tau);
+        }
+        let (x_coarse, v_coarse) = critically_damped_spring_step(x0, v0, 1.0, tau);
+
+        assert!((x - x_coarse).abs() < 1e-3, "{x} vs {x_coarse}");
+        assert!((v - v_coarse).abs() < 1e-2, "{v} vs {v_coarse}");
+    }
+
+    #[test]
+    fn clamped_offset() {
+        let state = State {
+            offset: Vec2::new(-10.0, 150.0),
+            max_offset: Vec2::new(-20.0, 100.0),
+            ..Default::default()
+        };
+        assert_eq!(state.clamped_offset(), Vec2::new(0.0, 100.0));
+        assert_eq!(state.overscroll(), Vec2::new(-10.0, 50.0));
     }
 }

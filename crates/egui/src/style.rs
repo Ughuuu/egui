@@ -830,9 +830,10 @@ impl ScrollFadeStyle {
 
 // ----------------------------------------------------------------------------
 
-/// Controls kinetic (momentum) scrolling of a [`crate::ScrollArea`],
-/// i.e. how the content keeps coasting after the user lets go of a drag
-/// (usually on a touch screen).
+/// The physics of drag-scrolling a [`crate::ScrollArea`], usually on a touch screen.
+///
+/// Controls how the content keeps coasting after the user lets go (kinetic scrolling),
+/// and how it rubber-bands when dragged past the edge.
 ///
 /// The velocity decays exponentially, like it does in `UIScrollView` on iOS/macOS:
 ///
@@ -864,6 +865,27 @@ pub struct KineticScrollStyle {
     ///
     /// The exponential decay never reaches zero velocity on its own, so we need a cutoff.
     pub stop_distance: f32,
+
+    /// Let the user drag (or coast) past the edge of the content, with increasing resistance,
+    /// and spring back when released. Like iOS.
+    ///
+    /// Only affects drag-to-scroll, not the scroll wheel or scroll bars.
+    pub rubber_band: bool,
+
+    /// How closely the content follows the finger when dragged past the edge, in `0..=1`.
+    ///
+    /// `1.0` means it initially follows the finger exactly, `0.0` means it doesn't move at all.
+    /// The resistance increases the further you go,
+    /// so the overscroll can never exceed the size of the viewport.
+    ///
+    /// iOS uses `0.55`.
+    pub rubber_band_slope: f32,
+
+    /// Time constant of the spring that pulls the content back to the edge, in seconds.
+    ///
+    /// The spring is critically damped, so there is no oscillation,
+    /// and it settles in roughly five time constants.
+    pub rubber_band_time: f32,
 }
 
 impl Default for KineticScrollStyle {
@@ -871,6 +893,9 @@ impl Default for KineticScrollStyle {
         Self {
             decay_time: 0.5,
             stop_distance: 0.5,
+            rubber_band: true,
+            rubber_band_slope: 0.55,
+            rubber_band_time: 0.1,
         }
     }
 }
@@ -888,6 +913,9 @@ impl KineticScrollStyle {
         let Self {
             decay_time,
             stop_distance,
+            rubber_band,
+            rubber_band_slope,
+            rubber_band_time,
         } = self;
 
         ui.horizontal(|ui| {
@@ -911,6 +939,32 @@ impl KineticScrollStyle {
                 );
                 ui.label("Kinetic scroll stop distance")
                     .on_hover_text("Stop when the remaining coast distance is shorter than this.");
+            });
+        }
+
+        ui.checkbox(rubber_band, "Rubber-band past the edge")
+            .on_hover_text("Let the user drag past the edge of the content, then spring back.");
+        if *rubber_band {
+            ui.horizontal(|ui| {
+                ui.add(
+                    DragValue::new(rubber_band_slope)
+                        .speed(0.01)
+                        .range(0.0..=1.0),
+                );
+                ui.label("Rubber-band slope").on_hover_text(
+                    "How closely the content follows the finger at the edge. iOS uses 0.55.",
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    DragValue::new(rubber_band_time)
+                        .speed(0.01)
+                        .range(0.0..=1.0)
+                        .suffix(" s"),
+                );
+                ui.label("Rubber-band spring time").on_hover_text(
+                    "Time constant of the spring-back. Settles in roughly five time constants.",
+                );
             });
         }
     }
