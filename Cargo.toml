@@ -171,6 +171,7 @@ webbrowser = "1.2.4" # 1.2.2 fixes RUSTSEC-2026-0257 (`BROWSER` argument injecti
 wgpu = { version = "30.0", default-features = false, features = ["std"] }
 windows-sys = "0.61.2"
 winit = { version = "0.30.13", default-features = false }
+zeno = { version = "0.3.3", default-features = false, features = ["eval", "std"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
