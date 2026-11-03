@@ -158,6 +158,68 @@ struct SlicedBuffer {
     capacity: wgpu::BufferAddress,
 }
 
+/// What vertices and indices cross to the GPU through, kept from frame to frame:
+/// on every backend wgpu implements itself, `Queue::write_buffer_with` makes a
+/// buffer per call and frees it once the GPU has copied from it.
+struct Staging {
+    belt: wgpu::util::StagingBelt,
+    capacity: wgpu::BufferAddress,
+}
+
+impl Staging {
+    /// `None` on the browser's WebGPU, where `write_buffer_with` is a copy in wasm
+    /// memory and one `writeBuffer`, makes no buffer, and a mapping would cross
+    /// into JavaScript three more times.
+    fn new(device: &wgpu::Device, capacity: wgpu::BufferAddress) -> Option<Self> {
+        (device.adapter_info().backend != wgpu::Backend::BrowserWebGpu).then(|| Self {
+            belt: wgpu::util::StagingBelt::new(device.clone(), capacity),
+            capacity,
+        })
+    }
+
+    /// Room for a frame's `bytes` in one chunk. A new belt rather than a larger
+    /// write: a belt never frees a chunk, so a UI growing a little each frame would
+    /// keep one more each frame. Chunks in flight go when the GPU is done with them.
+    fn reserve(&mut self, device: &wgpu::Device, bytes: wgpu::BufferAddress) {
+        if self.capacity < bytes {
+            self.capacity = (self.capacity * 2).at_least(bytes);
+            self.belt = wgpu::util::StagingBelt::new(device.clone(), self.capacity);
+        }
+    }
+}
+
+/// Mapped memory that ends up in a buffer once dropped, by either way across.
+enum Upload {
+    Belt(wgpu::BufferViewMut),
+    Queue(wgpu::QueueWriteBufferView),
+}
+
+impl Upload {
+    /// `encoder` carries the copy when the belt is the way across; the queue's
+    /// happens before the next submission on its own.
+    fn to(
+        target: &wgpu::Buffer,
+        size: NonZeroU64,
+        staging: Option<&mut Staging>,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Option<Self> {
+        match staging {
+            Some(staging) => Some(Self::Belt(
+                staging.belt.write_buffer(encoder, target, 0, size),
+            )),
+            None => queue.write_buffer_with(target, 0, size).map(Self::Queue),
+        }
+    }
+
+    fn slice(&mut self, range: Range<usize>) -> wgpu::WriteOnly<'_, [u8]> {
+        match self {
+            Self::Belt(view) => view.slice(range),
+            Self::Queue(view) => view.slice(range),
+        }
+    }
+}
+
 pub struct Texture {
     /// The texture may be None if the `TextureId` is just a handle to a user-provided bind-group.
     pub texture: Option<wgpu::Texture>,
@@ -239,6 +301,7 @@ pub struct Renderer {
 
     index_buffer: SlicedBuffer,
     vertex_buffer: SlicedBuffer,
+    staging: Option<Staging>,
 
     uniform_buffer: wgpu::Buffer,
     previous_uniform_buffer_content: UniformBuffer,
@@ -479,6 +542,10 @@ impl Renderer {
                 slices: Vec::with_capacity(64),
                 capacity: INDEX_BUFFER_START_CAPACITY,
             },
+            staging: Staging::new(
+                device,
+                VERTEX_BUFFER_START_CAPACITY + INDEX_BUFFER_START_CAPACITY,
+            ),
             uniform_buffer,
             // Buffers on wgpu are zero initialized, so this is indeed its current state!
             previous_uniform_buffer_content: UniformBuffer::zeroed(),
@@ -960,6 +1027,10 @@ impl Renderer {
     /// Uploads the uniform, vertex and index data used by the renderer.
     /// Should be called before [`Self::render`].
     ///
+    /// `encoder` may carry the copies into the buffers: record [`Self::render`]'s pass after
+    /// them on it, or on an encoder submitted later, and submit it, or a staging chunk stays
+    /// out of use.
+    ///
     /// Returns all user-defined command buffers gathered from [`CallbackTrait::prepare`] & [`CallbackTrait::finish_prepare`] callbacks.
     pub fn update_buffers(
         &mut self,
@@ -1009,6 +1080,15 @@ impl Renderer {
             })
         };
 
+        if let Some(staging) = &mut self.staging {
+            staging.reserve(
+                device,
+                ((core::mem::size_of::<u32>() * index_count) as wgpu::BufferAddress)
+                    .next_multiple_of(wgpu::MAP_ALIGNMENT)
+                    + (core::mem::size_of::<Vertex>() * vertex_count) as wgpu::BufferAddress,
+            );
+        }
+
         if index_count > 0 {
             profiling::scope!("indices", index_count.to_string().as_str());
 
@@ -1022,11 +1102,13 @@ impl Renderer {
                 self.index_buffer.buffer = create_index_buffer(device, self.index_buffer.capacity);
             }
 
-            let index_buffer_staging = queue.write_buffer_with(
+            let index_buffer_staging = Upload::to(
                 &self.index_buffer.buffer,
-                0,
                 #[expect(clippy::unwrap_used)] // Checked above
                 NonZeroU64::new(required_index_buffer_size).unwrap(),
+                self.staging.as_mut(),
+                queue,
+                encoder,
             );
 
             let Some(mut index_buffer_staging) = index_buffer_staging else {
@@ -1068,11 +1150,13 @@ impl Renderer {
                     create_vertex_buffer(device, self.vertex_buffer.capacity);
             }
 
-            let vertex_buffer_staging = queue.write_buffer_with(
+            let vertex_buffer_staging = Upload::to(
                 &self.vertex_buffer.buffer,
-                0,
                 #[expect(clippy::unwrap_used)] // Checked above
                 NonZeroU64::new(required_vertex_buffer_size).unwrap(),
+                self.staging.as_mut(),
+                queue,
+                encoder,
             );
 
             let Some(mut vertex_buffer_staging) = vertex_buffer_staging else {
@@ -1098,6 +1182,11 @@ impl Renderer {
                     Primitive::Callback(_) => {}
                 }
             }
+        }
+
+        // The views above dropped with their scopes, as the belt requires.
+        if let Some(staging) = &mut self.staging {
+            staging.belt.finish_and_recall_on_submit(encoder);
         }
 
         let mut user_cmd_bufs = Vec::new();
@@ -1273,3 +1362,207 @@ const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Renderer>();
 };
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    use epaint::{Color32, ColorImage, ImageData, Mesh, Pos2, Rect};
+
+    const SIDE: u32 = 4;
+    const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+    /// wgpu's native futures are ready when made.
+    fn ready<T>(future: impl Future<Output = T>) -> T {
+        match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("a native wgpu future was not ready"),
+        }
+    }
+
+    struct Gpu {
+        instance: wgpu::Instance,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        renderer: Renderer,
+        target: wgpu::Texture,
+        read: wgpu::Buffer,
+    }
+
+    fn gpu() -> Option<Gpu> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter =
+            ready(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        let (device, queue) =
+            ready(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+        let mut renderer = Renderer::new(&device, FORMAT, RendererOptions::PREDICTABLE);
+        let white = ColorImage::new([1, 1], vec![Color32::WHITE]);
+        renderer.update_texture(
+            &device,
+            &queue,
+            epaint::TextureId::default(),
+            &epaint::ImageDelta::full(ImageData::Color(white.into()), Default::default()),
+        );
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: SIDE,
+                height: SIDE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (wgpu::COPY_BYTES_PER_ROW_ALIGNMENT * SIDE) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Some(Gpu {
+            instance,
+            device,
+            queue,
+            renderer,
+            target,
+            read,
+        })
+    }
+
+    /// `quads` copies of a quad over the whole target, the last one showing.
+    fn paint_jobs(color: Color32, quads: usize) -> Vec<epaint::ClippedPrimitive> {
+        let whole = Rect::from_min_max(Pos2::ZERO, Pos2::new(SIDE as f32, SIDE as f32));
+        let mut mesh = Mesh::default();
+        for _ in 0..quads {
+            mesh.add_colored_rect(whole, color);
+        }
+        vec![epaint::ClippedPrimitive {
+            clip_rect: whole,
+            primitive: Primitive::Mesh(mesh),
+        }]
+    }
+
+    impl Gpu {
+        /// Draws `jobs` with everything on one encoder, and reads back one pixel.
+        fn frame(&mut self, jobs: &[epaint::ClippedPrimitive]) -> [u8; 4] {
+            let screen = ScreenDescriptor {
+                size_in_pixels: [SIDE, SIDE],
+                pixels_per_point: 1.0,
+            };
+            let view = self.target.create_view(&Default::default());
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            self.renderer
+                .update_buffers(&self.device, &self.queue, &mut encoder, jobs, &screen);
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    multiview_mask: None,
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
+            self.renderer.render(&mut pass, jobs, &screen);
+            drop(pass);
+            encoder.copy_texture_to_buffer(
+                self.target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &self.read,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: SIDE,
+                    height: SIDE,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.queue.submit([encoder.finish()]);
+            self.read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("the device is alive");
+            let view = self
+                .read
+                .slice(..)
+                .get_mapped_range()
+                .expect("mapped by the poll above");
+            let pixel = [view[0], view[1], view[2], view[3]];
+            drop(view);
+            self.read.unmap();
+            pixel
+        }
+
+        fn buffers(&self) -> usize {
+            self.instance
+                .generate_report()
+                .expect("not the browser's WebGPU")
+                .hub
+                .buffers
+                .num_allocated
+        }
+    }
+
+    #[test]
+    fn each_frame_draws_what_it_was_given_and_a_warm_one_makes_no_buffer() {
+        let Some(mut gpu) = gpu() else {
+            log::info!("no GPU adapter found, skipping");
+            return;
+        };
+        let colors = [Color32::RED, Color32::GREEN, Color32::BLUE];
+        for frame in 0..4 {
+            gpu.frame(&paint_jobs(colors[frame % 3], 1));
+        }
+        let warm = gpu.buffers();
+        for frame in 0..30 {
+            let color = colors[frame % 3];
+            let pixel = gpu.frame(&paint_jobs(color, 1));
+            assert_eq!(pixel, color.to_array(), "frame {frame}");
+        }
+        assert_eq!(gpu.buffers(), warm, "the staging chunks came back");
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_buffers_grows_them_and_still_draws() {
+        let Some(mut gpu) = gpu() else {
+            log::info!("no GPU adapter found, skipping");
+            return;
+        };
+        let start = gpu
+            .renderer
+            .staging
+            .as_ref()
+            .expect("a native backend")
+            .capacity;
+        let quads = 4 * start as usize / core::mem::size_of::<Vertex>();
+        let pixel = gpu.frame(&paint_jobs(Color32::GREEN, quads));
+        assert_eq!(pixel, Color32::GREEN.to_array());
+        assert!(
+            gpu.renderer
+                .staging
+                .as_ref()
+                .expect("a native backend")
+                .capacity
+                > start
+        );
+        let pixel = gpu.frame(&paint_jobs(Color32::RED, 1));
+        assert_eq!(pixel, Color32::RED.to_array(), "and a small one afterwards");
+    }
+}
